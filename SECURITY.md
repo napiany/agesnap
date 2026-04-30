@@ -35,13 +35,13 @@ Only the latest public code is considered supported for security fixes.
 
 - separation between `backup.cap` and the age identity
 - repository secret handling
-- encryption, decryption, MAC, or keyed chunk verification bugs
+- encryption, decryption, MAC, keyed pack, or keyed chunk verification bugs
 - restore path traversal
 - symlink handling during restore or metadata restore
 - unsafe overwrite behavior
 - hardlink, permission, uid/gid, or mtime handling with security impact
 - S3 immutable writes, especially `If-None-Match: *`
-- commit, manifest, or chunk tampering that passes verification
+- commit, manifest, pack, or chunk tampering that passes verification
 - data corruption that passes `check`
 - credential leakage in output, logs, errors, config, or object names
 - dependency issues with a demonstrated `agesnap` impact
@@ -61,10 +61,10 @@ Only the latest public code is considered supported for security fixes.
 - backup uses `backup.cap` and does not need the age identity
 - restore, check, and garbage collection require the age identity
 - repository secrets live in `secrets.age`
-- repository secrets are `repo_id`, `chunk_id_key`, `commit_mac_key`, and
-  `gear_seed`
-- chunk names are keyed BLAKE3 IDs, not raw plaintext hashes
-- chunks are verified after decryption and decompression
+- repository secrets are `repo_id`, `chunk_id_key`, `pack_id_key`,
+  `commit_mac_key`, and `gear_seed`
+- pack names are keyed BLAKE3 IDs, not raw plaintext hashes
+- packs and chunks are verified after decryption and decompression
 - commit objects are MACed and written last
 - immutable writes use S3 `PutObject` with `If-None-Match: *`
 - restore rejects unsafe paths

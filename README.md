@@ -7,8 +7,9 @@ S3-compatible object storage.
 > Experimental. Do not use it as your only backup.
 
 It walks one or more filesystem roots, writes an ASAR archive stream, splits the
-stream with content-defined chunking, compresses each chunk with zstd, encrypts
-it with age, and uploads the result to S3.
+stream with content-defined chunking, packs chunks into larger objects,
+compresses each pack with zstd, encrypts it with age, and uploads the result to
+S3.
 
 The general idea is close to [Tarsnap](https://www.tarsnap.com/): client-side
 encrypted, deduplicated online backups. `agesnap` is independent from Tarsnap

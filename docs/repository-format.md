@@ -5,17 +5,18 @@ An `agesnap` repository is an S3 object tree:
 ```text
 config.txt
 secrets.age
-chunks/<prefix>/<chunk_id>.age
+packs/<prefix>/<pack_id>.pack.age
 manifests/<prefix>/<snapshot_id>.manifest.age
 commits/<unix_nanos>-<snapshot_id>.commit
 locks/repo.lock
 ```
 
-Each chunk is a separate encrypted object. Snapshot manifests are encrypted too.
-A snapshot becomes visible only when its commit object has been written.
+Each pack is an immutable encrypted object containing one or more verified
+chunks. Snapshot manifests are encrypted too. A snapshot becomes visible only
+when its commit object has been written.
 
 `locks/repo.lock` serializes `backup`, `forget`, and `gc`. Without that lock,
-GC could delete an old unreferenced chunk while a backup is reusing it as a
+GC could delete an old unreferenced pack while a backup is reusing it as a
 dedupe hit. If a process crashes with the lock held, confirm no `backup`,
 `forget`, or `gc` is still running, then use `agesnap unlock --force`.
 
@@ -45,29 +46,32 @@ If-None-Match: *
 
 S3 accepts the write only if the object does not already exist.
 
-For chunks, that is both the immutable write and the dedupe check:
+For packs, that is both the immutable write and the dedupe check:
 
 ```text
-upload chunk object
+upload pack object
 if object already exists:
     treat as dedupe hit
 ```
 
-Transport failures are retried with the same chunk key. If the first attempt
+Transport failures are retried with the same pack key. If the first attempt
 actually committed, the retry gets `412 Precondition Failed` and treats the
-chunk as uploaded. `409 ConditionalRequestConflict` is retried with backoff.
+pack as uploaded. `409 ConditionalRequestConflict` is retried with backoff.
 Multipart upload is intentionally not used.
 
 Listings use `ListObjectsV2` with `encoding-type=url`, then percent-decode
 returned object keys. This avoids XML parser differences for valid S3 keys that
 are awkward to represent directly in XML.
 
-Resumability is chunk-object based. A crashed backup may leave orphan chunks,
+Resumability is pack-object based. A crashed backup may leave orphan packs,
 orphan manifests, or a stale lock. A snapshot is visible only after its commit
 object is written. After a stale lock is removed, the next backup rebuilds the
-archive stream and reuses existing chunks through `If-None-Match: *`. Garbage
-collection removes unreferenced chunks and orphan manifests only after the grace
+archive stream and reuses existing packs through `If-None-Match: *`. Garbage
+collection removes unreferenced packs and orphan manifests only after the grace
 period, default `7d`.
+
+The local index maps chunk IDs to pack IDs and is only an optimization for
+future backups. Restore and check do not require it.
 
 ## Credentials
 
@@ -87,7 +91,7 @@ Backup credentials normally need:
 
 Backup credentials should not be able to delete:
 
-- `chunks/*`
+- `packs/*`
 - `manifests/*`
 - `commits/*`
 

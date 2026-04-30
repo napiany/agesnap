@@ -75,7 +75,7 @@ agesnap check \
   --identity identity.txt
 ```
 
-Drop old snapshots, then garbage-collect unreferenced chunks:
+Drop old snapshots, then garbage-collect unreferenced packs:
 
 ```sh
 agesnap forget \
@@ -96,6 +96,7 @@ agesnap-config-v1
 
 repo.url = s3://my-bucket/backups/laptop
 capability.file = ./backup.cap
+index.path = ./agesnap.conf.index
 
 s3.region = eu-central-1
 s3.endpoint = https://s3.eu-central-1.amazonaws.com
@@ -104,6 +105,7 @@ s3.path_style = false
 chunk.min = 1048576
 chunk.avg = 4194304
 chunk.max = 16777216
+pack.target_bytes = 67108864
 
 compression.level = 3
 metadata.policy = strict

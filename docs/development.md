@@ -33,6 +33,7 @@ against real S3 or MinIO:
 - the same conditional `PutObject` returns `412 Precondition Failed`
 - `412` is treated as a dedupe hit
 - `409 ConditionalRequestConflict` is retried
+- pack objects are never overwritten
 - `ListObjectsV2` pagination works
 - `DeleteObject` works for `locks/repo.lock`
 - `locks/repo.lock` blocks concurrent `backup`, `forget`, and `gc`

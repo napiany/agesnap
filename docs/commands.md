@@ -21,8 +21,12 @@ agesnap init \
   --s3-region eu-central-1 \
   --recipient age1... \
   --config-out agesnap.conf \
-  --capability-out backup.cap
+  --capability-out backup.cap \
+  --pack-target 67108864
 ```
+
+`--pack-target` defaults to `67108864` and must be between `chunk.max` and
+256 MiB.
 
 ## `backup`
 
@@ -34,13 +38,16 @@ agesnap backup \
   --path /path/to/back/up \
   --name my-snapshot \
   --tag laptop \
-  --spool-dir /var/tmp
+  --spool-dir /var/tmp \
+  --index agesnap.conf.index
 ```
 
 Backup spools each regular file record before feeding it to the chunker. If a
 file changes during backup, `agesnap` retries once and then skips that file with
 a warning. The spool directory must have enough free space for the largest file
 being backed up. Without `--spool-dir`, the system temporary directory is used.
+The local chunk-to-pack index defaults to the config path plus `.index`; use
+`--index` to override it.
 
 ## `list`
 
@@ -90,11 +97,11 @@ agesnap forget \
   --keep-last 10
 ```
 
-This does not delete chunks.
+This does not delete packs.
 
 ## `gc`
 
-Delete unreferenced chunks:
+Delete unreferenced packs:
 
 ```sh
 agesnap gc \

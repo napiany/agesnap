@@ -10,7 +10,6 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +20,7 @@ const DEFAULT_TARGET_CHUNK: u32 = 4 << 20;
 const DEFAULT_MAX_CHUNK: u32 = 16 << 20;
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 const DEFAULT_GC_MIN_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_PACK_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 const S3_SIGNED_URL_TTL_SECS: u64 = 15 * 60;
 const S3_MAX_READ_BYTES: u64 = 512 * 1024 * 1024;
 const S3_MAX_OBJECT_KEY_BYTES: usize = 1024;
@@ -34,8 +34,11 @@ const MAX_MANIFEST_TAGS: usize = 1024;
 const MAX_MANIFEST_CHUNKS: usize = 1_000_000;
 
 const ASAR_MAGIC: &[u8; 8] = b"ASAR01\0\0";
+#[cfg(test)]
 const CHUNK_MAGIC: &[u8; 8] = b"ASCHK01\0";
-const MANIFEST_MAGIC: &[u8; 8] = b"ASMAN01\0";
+const MANIFEST_MAGIC: &[u8; 8] = b"ASMAN02\0";
+const PACK_MAGIC: &[u8; 8] = b"ASPAK01\0";
+const PACK_OBJECT_MAGIC: &[u8; 8] = b"ASPKO01\0";
 
 const REC_DIR: u8 = 1;
 const REC_FILE: u8 = 2;
@@ -83,9 +86,10 @@ commands:
   init
       --repo s3://bucket/prefix --s3-endpoint URL --s3-region REGION
       --recipient AGE_RECIPIENT --config-out agesnap.conf --capability-out backup.cap
+      [--pack-target BYTES]
   backup
       --config agesnap.conf [--path ROOT]... [--name NAME] [--tag TAG]
-      [--spool-dir DIR] [ROOT...]
+      [--spool-dir DIR] [--index PATH] [ROOT...]
   list
       --config agesnap.conf [--identity identity.txt]
   restore
@@ -172,12 +176,14 @@ impl MetadataPolicy {
 struct LocalConfig {
     repo: S3Repo,
     capability: Option<PathBuf>,
+    index_path: Option<PathBuf>,
     s3: S3ClientOptions,
     metadata_policy: MetadataPolicy,
     compression_level: i32,
     min_chunk: u32,
     target_chunk: u32,
     max_chunk: u32,
+    pack_target_bytes: u64,
     gc_min_age_secs: u64,
 }
 
@@ -186,12 +192,14 @@ impl LocalConfig {
         Self {
             repo,
             capability: None,
+            index_path: None,
             s3: S3ClientOptions::default(),
             metadata_policy: MetadataPolicy::Strict,
             compression_level: DEFAULT_ZSTD_LEVEL,
             min_chunk: DEFAULT_MIN_CHUNK,
             target_chunk: DEFAULT_TARGET_CHUNK,
             max_chunk: DEFAULT_MAX_CHUNK,
+            pack_target_bytes: DEFAULT_PACK_TARGET_BYTES,
             gc_min_age_secs: DEFAULT_GC_MIN_AGE_SECS,
         }
     }
@@ -205,6 +213,9 @@ impl LocalConfig {
                 "capability.file={}\n",
                 path_to_config_value(path)?
             ));
+        }
+        if let Some(path) = &self.index_path {
+            out.push_str(&format!("index.path={}\n", path_to_config_value(path)?));
         }
         if let Some(region) = &self.s3.region {
             out.push_str(&format!("s3.region={region}\n"));
@@ -221,6 +232,7 @@ impl LocalConfig {
         out.push_str(&format!("chunk.min={}\n", self.min_chunk));
         out.push_str(&format!("chunk.avg={}\n", self.target_chunk));
         out.push_str(&format!("chunk.max={}\n", self.max_chunk));
+        out.push_str(&format!("pack.target_bytes={}\n", self.pack_target_bytes));
         out.push_str(&format!(
             "gc.min_age={}\n",
             format_duration_secs(self.gc_min_age_secs)
@@ -233,6 +245,7 @@ impl LocalConfig {
         kv.reject_unknown(&[
             "repo.url",
             "capability.file",
+            "index.path",
             "s3.region",
             "s3.endpoint",
             "s3.path_style",
@@ -241,11 +254,13 @@ impl LocalConfig {
             "chunk.min",
             "chunk.avg",
             "chunk.max",
+            "pack.target_bytes",
             "gc.min_age",
         ])?;
         let repo = S3Repo::parse(kv.required("repo.url")?)?;
         let mut config = Self::default_for_repo(repo);
         config.capability = kv.optional("capability.file").map(PathBuf::from);
+        config.index_path = kv.optional("index.path").map(PathBuf::from);
         config.s3.region = kv.optional("s3.region").map(ToOwned::to_owned);
         config.s3.endpoint = kv.optional("s3.endpoint").map(ToOwned::to_owned);
         if let Some(value) = kv.optional("s3.path_style") {
@@ -266,10 +281,14 @@ impl LocalConfig {
         if let Some(value) = kv.optional("chunk.max") {
             config.max_chunk = value.parse()?;
         }
+        if let Some(value) = kv.optional("pack.target_bytes") {
+            config.pack_target_bytes = value.parse()?;
+        }
         if let Some(value) = kv.optional("gc.min_age") {
             config.gc_min_age_secs = parse_duration_secs(value)?;
         }
         validate_chunk_settings(config.min_chunk, config.target_chunk, config.max_chunk)?;
+        validate_pack_target(config.pack_target_bytes, config.max_chunk)?;
         Ok(config)
     }
 
@@ -287,6 +306,13 @@ impl LoadedLocalConfig {
     fn capability_path(&self) -> Option<PathBuf> {
         self.config
             .capability
+            .as_ref()
+            .map(|path| resolve_config_path(&self.path, path))
+    }
+
+    fn index_path(&self) -> Option<PathBuf> {
+        self.config
+            .index_path
             .as_ref()
             .map(|path| resolve_config_path(&self.path, path))
     }
@@ -344,16 +370,23 @@ fn cmd_init(args: Vec<OsString>) -> Result<()> {
     if let Some(value) = p.value("--chunk-max")? {
         local_config.max_chunk = value.parse()?;
     }
+    if let Some(value) = p.value("--pack-target")? {
+        local_config.pack_target_bytes = value.parse()?;
+    }
     validate_chunk_settings(
         local_config.min_chunk,
         local_config.target_chunk,
         local_config.max_chunk,
     )?;
+    validate_pack_target(local_config.pack_target_bytes, local_config.max_chunk)?;
     local_config.capability = Some(if config_path.is_some() {
         absolutize_path(&capability_path)?
     } else {
         capability_path.clone()
     });
+    if let Some(path) = &config_path {
+        local_config.index_path = Some(absolutize_path(&default_index_path(path))?);
+    }
     p.finish()?;
 
     if recipients.is_empty() {
@@ -363,10 +396,12 @@ fn cmd_init(args: Vec<OsString>) -> Result<()> {
 
     let mut repo_id = [0u8; 32];
     let mut chunk_id_key = [0u8; 32];
+    let mut pack_id_key = [0u8; 32];
     let mut commit_mac_key = [0u8; 32];
     let mut gear_seed = [0u8; 32];
     fill_random(&mut repo_id)?;
     fill_random(&mut chunk_id_key)?;
+    fill_random(&mut pack_id_key)?;
     fill_random(&mut commit_mac_key)?;
     fill_random(&mut gear_seed)?;
 
@@ -376,10 +411,12 @@ fn cmd_init(args: Vec<OsString>) -> Result<()> {
         min_chunk: local_config.min_chunk,
         target_chunk: local_config.target_chunk,
         max_chunk: local_config.max_chunk,
+        pack_target_bytes: local_config.pack_target_bytes,
     };
     let secrets = RepoSecrets {
         repo_id,
         chunk_id_key,
+        pack_id_key,
         commit_mac_key,
         gear_seed,
     };
@@ -390,8 +427,10 @@ fn cmd_init(args: Vec<OsString>) -> Result<()> {
         min_chunk: local_config.min_chunk,
         target_chunk: local_config.target_chunk,
         max_chunk: local_config.max_chunk,
+        pack_target_bytes: local_config.pack_target_bytes,
         compression_level: local_config.compression_level,
         chunk_id_key,
+        pack_id_key,
         commit_mac_key,
         gear_seed,
     };
@@ -530,6 +569,7 @@ fn cmd_backup(args: Vec<OsString>) -> Result<()> {
     let spool_dir = p
         .value_path("--spool-dir")
         .unwrap_or_else(std::env::temp_dir);
+    let index_path_override = p.value_path("--index");
     roots.extend(p.rest_paths());
     p.finish()?;
 
@@ -552,6 +592,22 @@ fn cmd_backup(args: Vec<OsString>) -> Result<()> {
     if public_config.repo_id != capability.repo_id {
         return err("repository config does not match capability");
     }
+    if public_config.pack_target_bytes != capability.pack_target_bytes {
+        return err("repository pack target does not match capability");
+    }
+    validate_pack_target(capability.pack_target_bytes, capability.max_chunk)?;
+
+    let index_path = index_path_override.unwrap_or_else(|| {
+        loaded_config
+            .as_ref()
+            .and_then(LoadedLocalConfig::index_path)
+            .unwrap_or_else(|| {
+                loaded_config.as_ref().map_or_else(
+                    || default_index_path(&cap_path),
+                    |loaded| default_index_path(&loaded.path),
+                )
+            })
+    });
 
     let request = BackupRequest {
         roots,
@@ -559,6 +615,7 @@ fn cmd_backup(args: Vec<OsString>) -> Result<()> {
         tags,
         compression_level,
         spool_dir,
+        index_path,
     };
     // Serialize with GC; otherwise a dedupe hit can race chunk deletion.
     let lock = RepoLock::acquire(&client, &repo, "backup")?;
@@ -575,6 +632,7 @@ struct BackupRequest {
     tags: Vec<OsString>,
     compression_level: i32,
     spool_dir: PathBuf,
+    index_path: PathBuf,
 }
 
 fn run_backup(
@@ -593,17 +651,24 @@ fn run_backup(
     let mut archive_roots = Vec::new();
     let mut used_root_names = HashSet::new();
     let mut chunk_refs = Vec::new();
-    let (tx, rx) = sync_channel(2);
-    let uploader = spawn_chunk_uploader(
-        client.clone(),
-        repo.clone(),
-        recipients.to_vec(),
-        capability.repo_id,
-        request.compression_level,
-        rx,
-    );
+    let live_pack_keys: BTreeSet<String> = list_keys(client, repo, "packs/")?.into_iter().collect();
+    let mut index = ChunkLocationIndex::load(&request.index_path, &capability.repo_id)?;
+    index.retain_live_packs(&live_pack_keys);
 
-    let scan_result = {
+    let (archive_len, pack_stats) = {
+        let mut pack_uploader = PackUploader {
+            client,
+            repo,
+            recipients,
+            repo_id: capability.repo_id,
+            pack_id_key: capability.pack_id_key,
+            compression_level: request.compression_level,
+            pack_target_bytes: capability.pack_target_bytes,
+            chunk_refs: &mut chunk_refs,
+            index: &mut index,
+            current: CurrentPack::default(),
+            stats: PackUploadStats { uploaded_packs: 0 },
+        };
         let mut chunker = GearChunker::new(
             capability.gear_seed,
             capability.min_chunk,
@@ -611,21 +676,11 @@ fn run_backup(
             capability.max_chunk,
             |chunk| {
                 let chunk_id = chunk_id(&capability.chunk_id_key, &chunk);
-                let plaintext_len = u32_checked(chunk.len(), "chunk length")?;
-                chunk_refs.push(ChunkRef {
-                    id: chunk_id,
-                    plaintext_len,
-                });
-                tx.send(ChunkUploadJob {
-                    id: chunk_id,
-                    chunk,
-                })
-                .map_err(|e| format!("chunk uploader stopped: {e}"))?;
-                Ok(())
+                pack_uploader.add_chunk(chunk_id, chunk)
             },
         )?;
 
-        (|| -> Result<u64> {
+        let archive_result = (|| -> Result<u64> {
             write_asar_header(&mut chunker, &capability.repo_id)?;
             for (idx, root) in request.roots.iter().enumerate() {
                 let archive_root = archive_root_name(idx, root, &mut used_root_names);
@@ -642,14 +697,11 @@ fn run_backup(
             let archive_len = chunker.total_len;
             chunker.finish()?;
             Ok(archive_len)
-        })()
+        })();
+        let archive_len = archive_result?;
+        let pack_stats = pack_uploader.finish()?;
+        (archive_len, pack_stats)
     };
-    drop(tx);
-    let upload_result = uploader
-        .join()
-        .map_err(|_| "chunk uploader thread panicked".to_string())?;
-    let archive_len = scan_result?;
-    let unique_uploaded = upload_result?;
 
     let manifest = SnapshotManifest {
         repo_id: capability.repo_id,
@@ -686,10 +738,18 @@ fn run_backup(
     let commit_text = commit.encode_signed(&capability.commit_mac_key);
     let commit_key = commit_key(created, &snapshot_id);
     put_immutable_new(client, repo, &commit_key, commit_text.into_bytes())?;
+    if let Err(e) = index.save_atomic(&request.index_path, &capability.repo_id) {
+        eprintln!("agesnap: warning: snapshot committed but local index update failed: {e}");
+    }
 
+    let referenced_packs: BTreeSet<[u8; 32]> = manifest
+        .chunk_refs
+        .iter()
+        .map(|chunk| chunk.pack_id)
+        .collect();
     println!("snapshot {}", hex(&snapshot_id));
     println!(
-        "files={} dirs={} symlinks={} hardlinks={} skipped={} logical_bytes={} chunks={} uploaded={}",
+        "files={} dirs={} symlinks={} hardlinks={} skipped={} logical_bytes={} chunks={} packs={} uploaded_packs={}",
         scan.files,
         scan.directories,
         scan.symlinks,
@@ -697,7 +757,8 @@ fn run_backup(
         scan.skipped_files,
         scan.logical_bytes,
         manifest.chunk_refs.len(),
-        unique_uploaded
+        referenced_packs.len(),
+        pack_stats.uploaded_packs
     );
     if scan.skipped_files > 0 {
         return err_code(
@@ -709,33 +770,6 @@ fn run_backup(
         );
     }
     Ok(())
-}
-
-struct ChunkUploadJob {
-    id: [u8; 32],
-    chunk: Vec<u8>,
-}
-
-fn spawn_chunk_uploader(
-    client: S3Client,
-    repo: S3Repo,
-    recipients: Vec<x25519::Recipient>,
-    repo_id: [u8; 32],
-    compression_level: i32,
-    rx: Receiver<ChunkUploadJob>,
-) -> thread::JoinHandle<Result<u64>> {
-    thread::spawn(move || {
-        let mut unique_uploaded = 0u64;
-        while let Ok(job) = rx.recv() {
-            let plaintext =
-                encode_chunk_plaintext(&repo_id, &job.id, &job.chunk, compression_level)?;
-            let ciphertext = age_encrypt(&recipients, &plaintext)?;
-            if put_immutable(&client, &repo, &chunk_key(&job.id), ciphertext)? {
-                unique_uploaded += 1;
-            }
-        }
-        Ok(unique_uploaded)
-    })
 }
 
 fn cmd_list(args: Vec<OsString>) -> Result<()> {
@@ -996,7 +1030,7 @@ fn run_gc(
     min_age_secs: u64,
 ) -> Result<()> {
     let commits = verified_commits(client, repo, secrets)?;
-    let mut live_chunks: BTreeSet<String> = BTreeSet::new();
+    let mut live_packs: BTreeSet<String> = BTreeSet::new();
     let mut live_manifests: BTreeSet<String> = BTreeSet::new();
 
     for commit in commits {
@@ -1012,19 +1046,19 @@ fn run_gc(
         }
         live_manifests.insert(commit.manifest_key);
         for chunk in manifest.chunk_refs {
-            live_chunks.insert(chunk_key(&chunk.id));
+            live_packs.insert(pack_key(&chunk.pack_id));
         }
     }
 
-    let all_chunks = list_objects(client, repo, "chunks/")?;
+    let all_packs = list_objects(client, repo, "packs/")?;
     let all_manifests = list_objects(client, repo, "manifests/")?;
     let now = unix_nanos()?;
     let min_age_ns = min_age_secs.saturating_mul(1_000_000_000);
     let mut removed = 0u64;
     let mut young = 0u64;
-    for (object, live_set) in all_chunks
+    for (object, live_set) in all_packs
         .into_iter()
-        .map(|object| (object, &live_chunks))
+        .map(|object| (object, &live_packs))
         .chain(
             all_manifests
                 .into_iter()
@@ -1104,22 +1138,52 @@ where
     }
 
     let mut archive_len = 0u64;
+    let mut pack_cache: HashMap<[u8; 32], HashMap<[u8; 32], Vec<u8>>> = HashMap::new();
+    let mut remaining_refs: HashMap<[u8; 32], usize> = HashMap::new();
     for chunk_ref in &manifest.chunk_refs {
-        let ciphertext = s3_get(client, repo, &chunk_key(&chunk_ref.id))?;
-        let plaintext = age_decrypt(identities, &ciphertext)?;
-        let chunk = decode_chunk_plaintext(
-            &secrets.repo_id,
-            &secrets.chunk_id_key,
-            &chunk_ref.id,
-            &plaintext,
-        )?;
+        *remaining_refs.entry(chunk_ref.pack_id).or_default() += 1;
+    }
+    for chunk_ref in &manifest.chunk_refs {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            pack_cache.entry(chunk_ref.pack_id)
+        {
+            let ciphertext = s3_get(client, repo, &pack_key(&chunk_ref.pack_id))?;
+            let plaintext = age_decrypt(identities, &ciphertext)?;
+            let chunks = decode_pack_object(
+                &secrets.repo_id,
+                &secrets.chunk_id_key,
+                &secrets.pack_id_key,
+                &chunk_ref.pack_id,
+                &plaintext,
+            )?;
+            entry.insert(chunks);
+        }
+        let pack = pack_cache
+            .get(&chunk_ref.pack_id)
+            .ok_or_else(|| "pack cache missing expected pack".to_string())?;
+        let chunk = pack
+            .get(&chunk_ref.id)
+            .ok_or_else(|| "pack missing manifest chunk".to_string())?;
         if chunk.len() != chunk_ref.plaintext_len as usize {
             return err("chunk length mismatch against manifest");
         }
         archive_len = archive_len
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| "archive length overflow".to_string())?;
-        consume(&chunk)?;
+        consume(chunk)?;
+        let remove_pack = {
+            let remaining = remaining_refs
+                .get_mut(&chunk_ref.pack_id)
+                .ok_or_else(|| "pack reference counter missing expected pack".to_string())?;
+            *remaining = remaining
+                .checked_sub(1)
+                .ok_or_else(|| "pack reference counter underflow".to_string())?;
+            *remaining == 0
+        };
+        if remove_pack {
+            remaining_refs.remove(&chunk_ref.pack_id);
+            pack_cache.remove(&chunk_ref.pack_id);
+        }
     }
     if archive_len != manifest.archive_len {
         return err("restored ASAR length does not match manifest");
@@ -2993,6 +3057,7 @@ fn raw_os_error_is(error: &std::io::Error, code: libc::c_int) -> bool {
     error.raw_os_error() == Some(code)
 }
 
+#[cfg(test)]
 fn encode_chunk_plaintext(
     repo_id: &[u8; 32],
     id: &[u8; 32],
@@ -3026,6 +3091,7 @@ fn encode_chunk_plaintext(
     Ok(out)
 }
 
+#[cfg(test)]
 fn decode_chunk_plaintext(
     repo_id: &[u8; 32],
     key: &[u8; 32],
@@ -3080,11 +3146,400 @@ fn decode_chunk_plaintext(
     Ok(chunk)
 }
 
+#[derive(Clone)]
+struct PackChunk {
+    id: [u8; 32],
+    data: Vec<u8>,
+}
+
+fn encode_pack_plaintext(
+    repo_id: &[u8; 32],
+    pack_id_key: &[u8; 32],
+    chunks: &[PackChunk],
+) -> Result<([u8; 32], Vec<u8>)> {
+    if chunks.is_empty() {
+        return err("cannot encode empty pack");
+    }
+    let pack_id = pack_id(pack_id_key, repo_id, chunks)?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    out.extend_from_slice(PACK_MAGIC);
+    push_u16(&mut out, 1);
+    push_u16(&mut out, 0);
+    out.extend_from_slice(repo_id);
+    out.extend_from_slice(&pack_id);
+    push_u32(&mut out, u32_checked(chunks.len(), "pack chunk count")?);
+    for chunk in chunks {
+        if !seen.insert(chunk.id) {
+            return err("pack contains duplicate chunk id");
+        }
+        if chunk.data.len() > MAX_CHUNK_PLAINTEXT_BYTES {
+            return err("pack chunk plaintext length exceeds 64 MiB");
+        }
+        out.extend_from_slice(&chunk.id);
+        push_u32(
+            &mut out,
+            u32_checked(chunk.data.len(), "pack chunk length")?,
+        );
+        out.extend_from_slice(&chunk.data);
+    }
+    Ok((pack_id, out))
+}
+
+fn encode_pack_object(
+    repo_id: &[u8; 32],
+    pack_id: &[u8; 32],
+    raw_pack: &[u8],
+    compression_level: i32,
+) -> Result<Vec<u8>> {
+    let (compression, payload) = if compression_level == 0 {
+        (0u8, raw_pack.to_vec())
+    } else {
+        let compressed = zstd::stream::encode_all(Cursor::new(raw_pack), compression_level)?;
+        if compressed.len() + 16 < raw_pack.len() {
+            (1u8, compressed)
+        } else {
+            (0u8, raw_pack.to_vec())
+        }
+    };
+    let mut out = Vec::new();
+    out.extend_from_slice(PACK_OBJECT_MAGIC);
+    push_u16(&mut out, 1);
+    push_u16(&mut out, 0);
+    out.extend_from_slice(repo_id);
+    out.extend_from_slice(pack_id);
+    push_u64(&mut out, raw_pack.len() as u64);
+    out.push(compression);
+    out.extend_from_slice(&[0u8; 3]);
+    push_bytes(&mut out, &payload)?;
+    Ok(out)
+}
+
+fn decode_pack_object(
+    repo_id: &[u8; 32],
+    chunk_id_key: &[u8; 32],
+    pack_id_key: &[u8; 32],
+    expected_pack_id: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<HashMap<[u8; 32], Vec<u8>>> {
+    let mut r = Reader::new(plaintext);
+    r.expect_bytes(PACK_OBJECT_MAGIC)?;
+    let version = r.u16()?;
+    let flags = r.u16()?;
+    if version != 1 || flags != 0 {
+        return err("unsupported pack object header");
+    }
+    let got_repo = r.array_32()?;
+    if &got_repo != repo_id {
+        return err("pack object repo id mismatch");
+    }
+    let got_pack_id = r.array_32()?;
+    if &got_pack_id != expected_pack_id {
+        return err("pack object id field mismatch");
+    }
+    let raw_len = usize_checked_u64(r.u64()?, "pack plaintext length")?;
+    if raw_len > S3_MAX_READ_BYTES as usize {
+        return err("pack plaintext length exceeds read limit");
+    }
+    let compression = r.u8()?;
+    r.expect_bytes(&[0, 0, 0])?;
+    let payload = r.bytes_limited(S3_MAX_READ_BYTES as usize, "pack payload")?;
+    r.finish()?;
+
+    let raw_pack = match compression {
+        0 => payload,
+        1 => {
+            let decoder = zstd::stream::read::Decoder::new(Cursor::new(payload))?;
+            let mut limited = decoder.take(S3_MAX_READ_BYTES + 1);
+            let mut decoded = Vec::new();
+            limited.read_to_end(&mut decoded)?;
+            if decoded.len() > S3_MAX_READ_BYTES as usize {
+                return err("decompressed pack exceeds read limit");
+            }
+            decoded
+        }
+        _ => return err("unknown pack compression"),
+    };
+    if raw_pack.len() != raw_len {
+        return err("pack plaintext length mismatch");
+    }
+    decode_pack_plaintext(
+        repo_id,
+        chunk_id_key,
+        pack_id_key,
+        expected_pack_id,
+        &raw_pack,
+    )
+}
+
+fn decode_pack_plaintext(
+    repo_id: &[u8; 32],
+    chunk_id_key: &[u8; 32],
+    pack_id_key: &[u8; 32],
+    expected_pack_id: &[u8; 32],
+    raw_pack: &[u8],
+) -> Result<HashMap<[u8; 32], Vec<u8>>> {
+    let mut r = Reader::new(raw_pack);
+    r.expect_bytes(PACK_MAGIC)?;
+    let version = r.u16()?;
+    let flags = r.u16()?;
+    if version != 1 || flags != 0 {
+        return err("unsupported pack header");
+    }
+    let got_repo = r.array_32()?;
+    if &got_repo != repo_id {
+        return err("pack repo id mismatch");
+    }
+    let got_pack_id = r.array_32()?;
+    if &got_pack_id != expected_pack_id {
+        return err("pack id field mismatch");
+    }
+    let chunk_count = r.u32()? as usize;
+    if chunk_count > MAX_MANIFEST_CHUNKS {
+        return err("pack has too many chunk records");
+    }
+    let mut chunks = Vec::with_capacity(chunk_count);
+    let mut out = HashMap::new();
+    for _ in 0..chunk_count {
+        let id = r.array_32()?;
+        let plaintext_len = r.u32()? as usize;
+        if plaintext_len > MAX_CHUNK_PLAINTEXT_BYTES {
+            return err("pack chunk plaintext length exceeds 64 MiB");
+        }
+        let data = r.take(plaintext_len)?.to_vec();
+        if chunk_id(chunk_id_key, &data) != id {
+            return err("keyed pack chunk verification failed");
+        }
+        if out.contains_key(&id) {
+            return err("pack contains duplicate chunk id");
+        }
+        chunks.push(PackChunk {
+            id,
+            data: data.clone(),
+        });
+        out.insert(id, data);
+    }
+    r.finish()?;
+    let got = pack_id(pack_id_key, repo_id, &chunks)?;
+    if &got != expected_pack_id {
+        return err("keyed pack id verification failed");
+    }
+    Ok(out)
+}
+
 fn chunk_id(key: &[u8; 32], chunk: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity("agesnap-chunk-v1\0".len() + chunk.len());
     input.extend_from_slice(b"agesnap-chunk-v1\0");
     input.extend_from_slice(chunk);
     *blake3::keyed_hash(key, &input).as_bytes()
+}
+
+fn pack_id(key: &[u8; 32], repo_id: &[u8; 32], chunks: &[PackChunk]) -> Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(b"agesnap-pack-v1\0");
+    hasher.update(repo_id);
+    for chunk in chunks {
+        if chunk.data.len() > MAX_CHUNK_PLAINTEXT_BYTES {
+            return err("pack chunk plaintext length exceeds 64 MiB");
+        }
+        hasher.update(&chunk.id);
+        hasher.update(&u32_checked(chunk.data.len(), "pack chunk length")?.to_be_bytes());
+        hasher.update(&chunk.data);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+#[derive(Default)]
+struct ChunkLocationIndex {
+    entries: HashMap<[u8; 32], [u8; 32]>,
+}
+
+impl ChunkLocationIndex {
+    fn load(path: &Path, repo_id: &[u8; 32]) -> Result<Self> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut lines = text.lines();
+        let first = lines
+            .by_ref()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'));
+        if first != Some("agesnap-index-v1") {
+            return err("unsupported index file");
+        }
+        let mut index = Self::default();
+        let mut saw_repo_id = false;
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("repo_id=") {
+                if saw_repo_id {
+                    return err("duplicate repo_id in index");
+                }
+                if parse_hex_32(value)? != *repo_id {
+                    return err("index repo id mismatch");
+                }
+                saw_repo_id = true;
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("entry=") {
+                let mut parts = value.split_whitespace();
+                let chunk_id = parse_hex_32(
+                    parts
+                        .next()
+                        .ok_or_else(|| "index entry missing chunk id".to_string())?,
+                )?;
+                let pack_id = parse_hex_32(
+                    parts
+                        .next()
+                        .ok_or_else(|| "index entry missing pack id".to_string())?,
+                )?;
+                if parts.next().is_some() {
+                    return err("index entry has trailing fields");
+                }
+                if index.entries.insert(chunk_id, pack_id).is_some() {
+                    return err("duplicate chunk id in index");
+                }
+                continue;
+            }
+            return err("unknown index line");
+        }
+        if !saw_repo_id {
+            return err("index missing repo_id");
+        }
+        Ok(index)
+    }
+
+    fn retain_live_packs(&mut self, live_pack_keys: &BTreeSet<String>) {
+        self.entries
+            .retain(|_, pack_id| live_pack_keys.contains(&pack_key(pack_id)));
+    }
+
+    fn save_atomic(&self, path: &Path, repo_id: &[u8; 32]) -> Result<()> {
+        let mut out = String::new();
+        out.push_str("agesnap-index-v1\n");
+        out.push_str(&format!("repo_id={}\n", hex(repo_id)));
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (chunk_id, pack_id) in entries {
+            out.push_str(&format!("entry={} {}\n", hex(chunk_id), hex(pack_id)));
+        }
+        let prepared = PreparedPrivateFile::create(path, out.as_bytes(), true)?;
+        prepared.commit()
+    }
+}
+
+#[derive(Default)]
+struct CurrentPack {
+    chunks: Vec<PackChunk>,
+    pending: HashMap<[u8; 32], PendingPackChunk>,
+    bytes: u64,
+}
+
+struct PendingPackChunk {
+    plaintext_len: u32,
+    manifest_indices: Vec<usize>,
+}
+
+struct PackUploadStats {
+    uploaded_packs: u64,
+}
+
+struct PackUploader<'a> {
+    client: &'a S3Client,
+    repo: &'a S3Repo,
+    recipients: &'a [x25519::Recipient],
+    repo_id: [u8; 32],
+    pack_id_key: [u8; 32],
+    compression_level: i32,
+    pack_target_bytes: u64,
+    chunk_refs: &'a mut Vec<ChunkRef>,
+    index: &'a mut ChunkLocationIndex,
+    current: CurrentPack,
+    stats: PackUploadStats,
+}
+
+impl<'a> PackUploader<'a> {
+    fn add_chunk(&mut self, id: [u8; 32], chunk: Vec<u8>) -> Result<()> {
+        let plaintext_len = u32_checked(chunk.len(), "chunk length")?;
+        if let Some(pack_id) = self.index.entries.get(&id).copied() {
+            self.chunk_refs.push(ChunkRef {
+                id,
+                plaintext_len,
+                pack_id,
+            });
+            return Ok(());
+        }
+        if let Some(pending) = self.current.pending.get_mut(&id) {
+            if pending.plaintext_len != plaintext_len {
+                return err("duplicate chunk id has different length");
+            }
+            let idx = self.chunk_refs.len();
+            self.chunk_refs.push(ChunkRef {
+                id,
+                plaintext_len,
+                pack_id: [0u8; 32],
+            });
+            pending.manifest_indices.push(idx);
+            return Ok(());
+        }
+        if self.current.bytes > 0
+            && self.current.bytes.saturating_add(chunk.len() as u64) > self.pack_target_bytes
+        {
+            self.flush()?;
+        }
+        let idx = self.chunk_refs.len();
+        self.chunk_refs.push(ChunkRef {
+            id,
+            plaintext_len,
+            pack_id: [0u8; 32],
+        });
+        self.current.bytes = self.current.bytes.saturating_add(chunk.len() as u64);
+        self.current.chunks.push(PackChunk { id, data: chunk });
+        self.current.pending.insert(
+            id,
+            PendingPackChunk {
+                plaintext_len,
+                manifest_indices: vec![idx],
+            },
+        );
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<PackUploadStats> {
+        self.flush()?;
+        Ok(self.stats)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.current.chunks.is_empty() {
+            return Ok(());
+        }
+        let chunks = std::mem::take(&mut self.current.chunks);
+        let pending = std::mem::take(&mut self.current.pending);
+        self.current.bytes = 0;
+        let (pack_id, raw_pack) = encode_pack_plaintext(&self.repo_id, &self.pack_id_key, &chunks)?;
+        let object_plaintext =
+            encode_pack_object(&self.repo_id, &pack_id, &raw_pack, self.compression_level)?;
+        let ciphertext = age_encrypt(self.recipients, &object_plaintext)?;
+        if put_immutable(self.client, self.repo, &pack_key(&pack_id), ciphertext)? {
+            self.stats.uploaded_packs += 1;
+        }
+        for chunk in &chunks {
+            self.index.entries.insert(chunk.id, pack_id);
+            let pending = pending
+                .get(&chunk.id)
+                .ok_or_else(|| "missing pending pack chunk".to_string())?;
+            for idx in &pending.manifest_indices {
+                self.chunk_refs[*idx].pack_id = pack_id;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn commit_mac(key: &[u8; 32], bytes_before_mac_line: &[u8]) -> [u8; 32] {
@@ -3737,8 +4192,10 @@ struct Capability {
     min_chunk: u32,
     target_chunk: u32,
     max_chunk: u32,
+    pack_target_bytes: u64,
     compression_level: i32,
     chunk_id_key: [u8; 32],
+    pack_id_key: [u8; 32],
     commit_mac_key: [u8; 32],
     gear_seed: [u8; 32],
 }
@@ -3746,14 +4203,16 @@ struct Capability {
 impl Capability {
     fn encode(&self) -> String {
         let mut out = String::new();
-        out.push_str("agesnap-capability-v1\n");
+        out.push_str("agesnap-capability-v2\n");
         out.push_str(&format!("repo={}\n", self.repo));
         out.push_str(&format!("repo_id={}\n", hex(&self.repo_id)));
         out.push_str(&format!("min_chunk={}\n", self.min_chunk));
         out.push_str(&format!("target_chunk={}\n", self.target_chunk));
         out.push_str(&format!("max_chunk={}\n", self.max_chunk));
+        out.push_str(&format!("pack_target_bytes={}\n", self.pack_target_bytes));
         out.push_str(&format!("compression_level={}\n", self.compression_level));
         out.push_str(&format!("chunk_id_key={}\n", hex(&self.chunk_id_key)));
+        out.push_str(&format!("pack_id_key={}\n", hex(&self.pack_id_key)));
         out.push_str(&format!("commit_mac_key={}\n", hex(&self.commit_mac_key)));
         out.push_str(&format!("gear_seed={}\n", hex(&self.gear_seed)));
         for r in &self.recipients {
@@ -3763,15 +4222,20 @@ impl Capability {
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let kv = KeyValues::parse_with_repeated(text, "agesnap-capability-v1", &["recipient"])?;
+        if text.lines().next().map(str::trim) == Some("agesnap-capability-v1") {
+            return err("unsupported v1 capability: create a new v2 repository");
+        }
+        let kv = KeyValues::parse_with_repeated(text, "agesnap-capability-v2", &["recipient"])?;
         kv.reject_unknown(&[
             "repo",
             "repo_id",
             "min_chunk",
             "target_chunk",
             "max_chunk",
+            "pack_target_bytes",
             "compression_level",
             "chunk_id_key",
+            "pack_id_key",
             "commit_mac_key",
             "gear_seed",
             "recipient",
@@ -3782,12 +4246,14 @@ impl Capability {
             min_chunk: kv.required("min_chunk")?.parse()?,
             target_chunk: kv.required("target_chunk")?.parse()?,
             max_chunk: kv.required("max_chunk")?.parse()?,
+            pack_target_bytes: kv.required("pack_target_bytes")?.parse()?,
             compression_level: kv
                 .optional("compression_level")
                 .map(parse_compression_level)
                 .transpose()?
                 .unwrap_or(DEFAULT_ZSTD_LEVEL),
             chunk_id_key: parse_hex_32(kv.required("chunk_id_key")?)?,
+            pack_id_key: parse_hex_32(kv.required("pack_id_key")?)?,
             commit_mac_key: parse_hex_32(kv.required("commit_mac_key")?)?,
             gear_seed: parse_hex_32(kv.required("gear_seed")?)?,
             recipients: kv.all("recipient").to_vec(),
@@ -3797,6 +4263,7 @@ impl Capability {
             capability.target_chunk,
             capability.max_chunk,
         )?;
+        validate_pack_target(capability.pack_target_bytes, capability.max_chunk)?;
         Ok(capability)
     }
 }
@@ -3807,18 +4274,20 @@ struct PublicConfig {
     min_chunk: u32,
     target_chunk: u32,
     max_chunk: u32,
+    pack_target_bytes: u64,
 }
 
 impl PublicConfig {
     fn encode(&self) -> String {
         let mut out = String::new();
-        out.push_str("agesnap-repo-v1\n");
+        out.push_str("agesnap-repo-v2\n");
         out.push_str(&format!("repo_id={}\n", hex(&self.repo_id)));
         out.push_str(&format!("created_unix_nanos={}\n", self.created_unix_ns));
         out.push_str("chunker=gear\n");
         out.push_str(&format!("chunk_min={}\n", self.min_chunk));
         out.push_str(&format!("chunk_avg={}\n", self.target_chunk));
         out.push_str(&format!("chunk_max={}\n", self.max_chunk));
+        out.push_str(&format!("pack_target_bytes={}\n", self.pack_target_bytes));
         out.push_str("compression=zstd\n");
         out.push_str("archive_format=asar-v1\n");
         out
@@ -3826,25 +4295,12 @@ impl PublicConfig {
 
     fn parse(text: &str) -> Result<Self> {
         if text.lines().next().map(str::trim) == Some("agesnap-config-v1") {
-            let kv = KeyValues::parse(text, "agesnap-config-v1")?;
-            kv.reject_unknown(&[
-                "repo_id",
-                "min_chunk",
-                "target_chunk",
-                "max_chunk",
-                "recipient",
-            ])?;
-            let config = Self {
-                repo_id: parse_hex_32(kv.required("repo_id")?)?,
-                created_unix_ns: 0,
-                min_chunk: kv.required("min_chunk")?.parse()?,
-                target_chunk: kv.required("target_chunk")?.parse()?,
-                max_chunk: kv.required("max_chunk")?.parse()?,
-            };
-            validate_chunk_settings(config.min_chunk, config.target_chunk, config.max_chunk)?;
-            return Ok(config);
+            return err("unsupported legacy config.txt: create a new v2 repository");
         }
-        let kv = KeyValues::parse(text, "agesnap-repo-v1")?;
+        if text.lines().next().map(str::trim) == Some("agesnap-repo-v1") {
+            return err("unsupported v1 repository: create a new v2 repository");
+        }
+        let kv = KeyValues::parse(text, "agesnap-repo-v2")?;
         kv.reject_unknown(&[
             "repo_id",
             "created_unix_nanos",
@@ -3852,6 +4308,7 @@ impl PublicConfig {
             "chunk_min",
             "chunk_avg",
             "chunk_max",
+            "pack_target_bytes",
             "compression",
             "archive_format",
         ])?;
@@ -3870,8 +4327,10 @@ impl PublicConfig {
             min_chunk: kv.required("chunk_min")?.parse()?,
             target_chunk: kv.required("chunk_avg")?.parse()?,
             max_chunk: kv.required("chunk_max")?.parse()?,
+            pack_target_bytes: kv.required("pack_target_bytes")?.parse()?,
         };
         validate_chunk_settings(config.min_chunk, config.target_chunk, config.max_chunk)?;
+        validate_pack_target(config.pack_target_bytes, config.max_chunk)?;
         Ok(config)
     }
 }
@@ -3880,6 +4339,7 @@ impl PublicConfig {
 struct RepoSecrets {
     repo_id: [u8; 32],
     chunk_id_key: [u8; 32],
+    pack_id_key: [u8; 32],
     commit_mac_key: [u8; 32],
     gear_seed: [u8; 32],
 }
@@ -3887,20 +4347,31 @@ struct RepoSecrets {
 impl RepoSecrets {
     fn encode(&self) -> String {
         format!(
-            "agesnap-secrets-v1\nrepo_id={}\nchunk_id_key={}\ncommit_mac_key={}\ngear_seed={}\n",
+            "agesnap-secrets-v2\nrepo_id={}\nchunk_id_key={}\npack_id_key={}\ncommit_mac_key={}\ngear_seed={}\n",
             hex(&self.repo_id),
             hex(&self.chunk_id_key),
+            hex(&self.pack_id_key),
             hex(&self.commit_mac_key),
             hex(&self.gear_seed)
         )
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let kv = KeyValues::parse(text, "agesnap-secrets-v1")?;
-        kv.reject_unknown(&["repo_id", "chunk_id_key", "commit_mac_key", "gear_seed"])?;
+        if text.lines().next().map(str::trim) == Some("agesnap-secrets-v1") {
+            return err("unsupported v1 repository secrets: create a new v2 repository");
+        }
+        let kv = KeyValues::parse(text, "agesnap-secrets-v2")?;
+        kv.reject_unknown(&[
+            "repo_id",
+            "chunk_id_key",
+            "pack_id_key",
+            "commit_mac_key",
+            "gear_seed",
+        ])?;
         Ok(Self {
             repo_id: parse_hex_32(kv.required("repo_id")?)?,
             chunk_id_key: parse_hex_32(kv.required("chunk_id_key")?)?,
+            pack_id_key: parse_hex_32(kv.required("pack_id_key")?)?,
             commit_mac_key: parse_hex_32(kv.required("commit_mac_key")?)?,
             gear_seed: parse_hex_32(kv.required("gear_seed")?)?,
         })
@@ -4133,6 +4604,7 @@ impl SnapshotManifest {
         for c in &self.chunk_refs {
             out.extend_from_slice(&c.id);
             push_u32(&mut out, c.plaintext_len);
+            out.extend_from_slice(&c.pack_id);
         }
         Ok(out)
     }
@@ -4161,6 +4633,9 @@ impl SnapshotManifest {
         for chunk_ref in &self.chunk_refs {
             if chunk_ref.plaintext_len as usize > MAX_CHUNK_PLAINTEXT_BYTES {
                 return err("manifest chunk plaintext length exceeds 64 MiB");
+            }
+            if chunk_ref.pack_id == [0u8; 32] {
+                return err("manifest chunk reference is missing pack id");
             }
         }
         Ok(())
@@ -4204,7 +4679,15 @@ impl SnapshotManifest {
             if plaintext_len as usize > MAX_CHUNK_PLAINTEXT_BYTES {
                 return err("manifest chunk plaintext length exceeds 64 MiB");
             }
-            chunk_refs.push(ChunkRef { id, plaintext_len });
+            let pack_id = r.array_32()?;
+            if pack_id == [0u8; 32] {
+                return err("manifest chunk reference is missing pack id");
+            }
+            chunk_refs.push(ChunkRef {
+                id,
+                plaintext_len,
+                pack_id,
+            });
         }
         r.finish()?;
         Ok(Self {
@@ -4228,6 +4711,7 @@ impl SnapshotManifest {
 struct ChunkRef {
     id: [u8; 32],
     plaintext_len: u32,
+    pack_id: [u8; 32],
 }
 
 #[derive(Default)]
@@ -4666,9 +5150,9 @@ fn push_path(out: &mut Vec<u8>, path: &PathParts) -> Result<()> {
     Ok(())
 }
 
-fn chunk_key(id: &[u8; 32]) -> String {
+fn pack_key(id: &[u8; 32]) -> String {
     let h = hex(id);
-    format!("chunks/{}/{}.age", &h[..2], h)
+    format!("packs/{}/{}.pack.age", &h[..2], h)
 }
 
 fn manifest_key(snapshot_id: &[u8; 32]) -> String {
@@ -5061,6 +5545,12 @@ fn resolve_config_path(config_path: &Path, path: &Path) -> PathBuf {
         .join(path)
 }
 
+fn default_index_path(path: &Path) -> PathBuf {
+    let mut bytes = path.as_os_str().as_bytes().to_vec();
+    bytes.extend_from_slice(b".index");
+    PathBuf::from(OsString::from_vec(bytes))
+}
+
 fn absolutize_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -5124,6 +5614,16 @@ fn validate_chunk_settings(min: u32, target: u32, max: u32) -> Result<()> {
     }
     if max > 64 * 1024 * 1024 {
         return err("chunk.max must be at most 64 MiB");
+    }
+    Ok(())
+}
+
+fn validate_pack_target(pack_target_bytes: u64, max_chunk: u32) -> Result<()> {
+    if pack_target_bytes < u64::from(max_chunk) {
+        return err("pack.target_bytes must be at least chunk.max");
+    }
+    if pack_target_bytes > 256 * 1024 * 1024 {
+        return err("pack.target_bytes must be at most 256 MiB");
     }
     Ok(())
 }
@@ -5347,6 +5847,122 @@ mod tests {
     }
 
     #[test]
+    fn pack_id_is_deterministic_and_pack_decodes() -> Result<()> {
+        let repo_id = [1u8; 32];
+        let chunk_key = [2u8; 32];
+        let pack_key = [3u8; 32];
+        let chunks = vec![
+            PackChunk {
+                id: chunk_id(&chunk_key, b"alpha"),
+                data: b"alpha".to_vec(),
+            },
+            PackChunk {
+                id: chunk_id(&chunk_key, b"beta"),
+                data: b"beta".to_vec(),
+            },
+        ];
+        let (id1, raw1) = encode_pack_plaintext(&repo_id, &pack_key, &chunks)?;
+        let (id2, raw2) = encode_pack_plaintext(&repo_id, &pack_key, &chunks)?;
+        assert_eq!(id1, id2);
+        assert_eq!(raw1, raw2);
+
+        let object = encode_pack_object(&repo_id, &id1, &raw1, 0)?;
+        let decoded = decode_pack_object(&repo_id, &chunk_key, &pack_key, &id1, &object)?;
+        assert_eq!(
+            decoded.get(&chunks[0].id).map(Vec::as_slice),
+            Some(&b"alpha"[..])
+        );
+        assert_eq!(
+            decoded.get(&chunks[1].id).map(Vec::as_slice),
+            Some(&b"beta"[..])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pack_parser_rejects_wrong_ids_and_tampering() -> Result<()> {
+        let repo_id = [1u8; 32];
+        let chunk_key = [2u8; 32];
+        let pack_key = [3u8; 32];
+        let chunks = vec![PackChunk {
+            id: chunk_id(&chunk_key, b"alpha"),
+            data: b"alpha".to_vec(),
+        }];
+        let (pack_id, raw) = encode_pack_plaintext(&repo_id, &pack_key, &chunks)?;
+        let object = encode_pack_object(&repo_id, &pack_id, &raw, 0)?;
+
+        assert!(decode_pack_object(&[9u8; 32], &chunk_key, &pack_key, &pack_id, &object).is_err());
+        assert!(decode_pack_object(&repo_id, &chunk_key, &pack_key, &[9u8; 32], &object).is_err());
+
+        let mut tampered = object.clone();
+        let last = tampered.last_mut().expect("pack object is non-empty");
+        *last ^= 1;
+        assert!(decode_pack_object(&repo_id, &chunk_key, &pack_key, &pack_id, &tampered).is_err());
+
+        let wrong_chunk_id = vec![PackChunk {
+            id: [8u8; 32],
+            data: b"alpha".to_vec(),
+        }];
+        let (wrong_pack_id, wrong_raw) =
+            encode_pack_plaintext(&repo_id, &pack_key, &wrong_chunk_id)?;
+        assert!(
+            decode_pack_plaintext(&repo_id, &chunk_key, &pack_key, &wrong_pack_id, &wrong_raw)
+                .is_err()
+        );
+
+        let duplicate_chunks = vec![
+            chunks[0].clone(),
+            PackChunk {
+                id: chunks[0].id,
+                data: b"alpha again".to_vec(),
+            },
+        ];
+        assert!(encode_pack_plaintext(&repo_id, &pack_key, &duplicate_chunks).is_err());
+
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(PACK_MAGIC);
+        push_u16(&mut malformed, 1);
+        push_u16(&mut malformed, 0);
+        malformed.extend_from_slice(&repo_id);
+        malformed.extend_from_slice(&pack_id);
+        push_u32(&mut malformed, 1);
+        assert!(
+            decode_pack_plaintext(&repo_id, &chunk_key, &pack_key, &pack_id, &malformed).is_err()
+        );
+
+        let mut oversized = malformed;
+        oversized.extend_from_slice(&chunks[0].id);
+        push_u32(&mut oversized, (MAX_CHUNK_PLAINTEXT_BYTES as u32) + 1);
+        assert!(
+            decode_pack_plaintext(&repo_id, &chunk_key, &pack_key, &pack_id, &oversized).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_index_round_trips_and_rejects_malformed() -> Result<()> {
+        let dir = TestDir::new("index")?;
+        let path = dir.path.join("backup.index");
+        let repo_id = [7u8; 32];
+        let chunk_id = [1u8; 32];
+        let pack_id = [2u8; 32];
+        let mut index = ChunkLocationIndex::default();
+        index.entries.insert(chunk_id, pack_id);
+        index.save_atomic(&path, &repo_id)?;
+
+        let loaded = ChunkLocationIndex::load(&path, &repo_id)?;
+        assert_eq!(loaded.entries.get(&chunk_id), Some(&pack_id));
+
+        let mut filtered = loaded;
+        filtered.retain_live_packs(&BTreeSet::new());
+        assert!(filtered.entries.is_empty());
+
+        fs::write(&path, b"not-an-index\n")?;
+        assert!(ChunkLocationIndex::load(&path, &repo_id).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn commit_mac_rejects_tampering() -> Result<()> {
         let key = [4u8; 32];
         let commit = Commit {
@@ -5424,10 +6040,12 @@ mod tests {
             min_chunk: DEFAULT_MIN_CHUNK,
             target_chunk: DEFAULT_TARGET_CHUNK,
             max_chunk: DEFAULT_MAX_CHUNK,
+            pack_target_bytes: DEFAULT_PACK_TARGET_BYTES,
         };
         let text = config.encode();
-        assert!(text.starts_with("agesnap-repo-v1\n"));
+        assert!(text.starts_with("agesnap-repo-v2\n"));
         assert!(text.contains("chunker=gear\n"));
+        assert!(text.contains("pack_target_bytes=67108864\n"));
         assert!(text.contains("archive_format=asar-v1\n"));
         assert!(!text.contains("recipient="));
         let parsed = PublicConfig::parse(&text)?;
@@ -5440,6 +6058,7 @@ mod tests {
     fn local_config_round_trips_s3_and_policy_fields() -> Result<()> {
         let mut config = LocalConfig::default_for_repo(S3Repo::parse("s3://bucket/prefix")?);
         config.capability = Some(PathBuf::from("/tmp/backup.cap"));
+        config.index_path = Some(PathBuf::from("/tmp/backup.cap.index"));
         config.s3.region = Some("us-west-2".to_string());
         config.s3.endpoint = Some("https://s3.example.test".to_string());
         config.s3.path_style = true;
@@ -5451,11 +6070,14 @@ mod tests {
         assert!(text.starts_with("agesnap-config-v1\n"));
         assert!(text.contains("repo.url=s3://bucket/prefix\n"));
         assert!(text.contains("capability.file=/tmp/backup.cap\n"));
+        assert!(text.contains("index.path=/tmp/backup.cap.index\n"));
+        assert!(text.contains("pack.target_bytes=67108864\n"));
         assert!(!text.contains("s3.bucket="));
         assert!(text.contains("gc.min_age=2d\n"));
         let parsed = LocalConfig::parse(&text)?;
         assert_eq!(parsed.repo, config.repo);
         assert_eq!(parsed.capability, config.capability);
+        assert_eq!(parsed.index_path, config.index_path);
         assert_eq!(parsed.s3.region, config.s3.region);
         assert_eq!(parsed.s3.endpoint, config.s3.endpoint);
         assert!(parsed.s3.path_style);
@@ -5479,6 +6101,7 @@ compression.level = 3
 chunk.min = 1048576
 chunk.avg = 4194304
 chunk.max = 16777216
+pack.target_bytes = 67108864
 gc.min_age = 7d
 ";
         let parsed = LocalConfig::parse(text)?;
@@ -5533,6 +6156,7 @@ repo.url = s3://bucket/prefix
             chunk_refs: vec![ChunkRef {
                 id: [2u8; 32],
                 plaintext_len: 0,
+                pack_id: [3u8; 32],
             }],
         };
 
@@ -5545,6 +6169,10 @@ repo.url = s3://bucket/prefix
 
         manifest.tags.clear();
         manifest.chunk_refs[0].plaintext_len = (MAX_CHUNK_PLAINTEXT_BYTES as u32) + 1;
+        assert!(manifest.encode().is_err());
+
+        manifest.chunk_refs[0].plaintext_len = 0;
+        manifest.chunk_refs[0].pack_id = [0u8; 32];
         assert!(manifest.encode().is_err());
     }
 
@@ -5609,7 +6237,7 @@ mac=0303030303030303030303030303030303030303030303030303030303030303
                 <IsTruncated>true</IsTruncated>
                 <EncodingType>url</EncodingType>
                 <Contents>
-                    <Key>chunks/ab/a%26%7B%7Db.age</Key>
+                    <Key>packs/ab/a%26%7B%7Db.pack.age</Key>
                     <LastModified>2026-04-27T09:08:07.123456789Z</LastModified>
                 </Contents>
                 <NextContinuationToken>next&lt;&#116;oken&gt;</NextContinuationToken>
@@ -5619,7 +6247,7 @@ mac=0303030303030303030303030303030303030303030303030303030303030303
         assert!(page.is_truncated);
         assert_eq!(page.next_continuation_token.as_deref(), Some("next<token>"));
         assert_eq!(page.objects.len(), 1);
-        assert_eq!(page.objects[0].key, "chunks/ab/a&{}b.age");
+        assert_eq!(page.objects[0].key, "packs/ab/a&{}b.pack.age");
         assert_eq!(
             page.objects[0].last_modified_unix_ns,
             Some(parse_s3_last_modified_unix_ns(
@@ -5635,13 +6263,13 @@ mac=0303030303030303030303030303030303030303030303030303030303030303
             <ListBucketResult>
                 <IsTruncated>false</IsTruncated>
                 <Contents>
-                    <Key>chunks/ab/a%2Fb.age</Key>
+                    <Key>packs/ab/a%2Fb.pack.age</Key>
                 </Contents>
             </ListBucketResult>
         "#;
         let page = parse_list_objects_v2_xml(xml)?;
         assert_eq!(page.objects.len(), 1);
-        assert_eq!(page.objects[0].key, "chunks/ab/a%2Fb.age");
+        assert_eq!(page.objects[0].key, "packs/ab/a%2Fb.pack.age");
         Ok(())
     }
 

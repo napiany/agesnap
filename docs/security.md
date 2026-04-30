@@ -24,6 +24,7 @@ recipient. They include:
 
 - `repo_id`
 - `chunk_id_key`
+- `pack_id_key`
 - `commit_mac_key`
 - `gear_seed`
 
@@ -114,7 +115,7 @@ Not solved:
 - a compromised source host writing malicious snapshots
 - a stolen backup capability writing new snapshots
 - traffic analysis
-- object count and object size leakage
+- pack count and pack size leakage
 
 Bucket versioning, Object Lock, and restricted IAM credentials help with the
 cases that are not solved by the file format.
